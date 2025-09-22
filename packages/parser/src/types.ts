@@ -2,6 +2,7 @@ import type { AnyNode, DocumentNode } from '@humanwhocodes/momoa';
 import type { TokenNormalized } from '@terrazzo/token-tools';
 import type ytm from 'yaml-to-momoa';
 import type Logger from './logger.js';
+import type { RefMap } from '@terrazzo/json-schema-tools';
 
 export interface BuildHookOptions {
   /** Map of tokens */
@@ -247,6 +248,8 @@ export interface OutputFileExpanded extends OutputFile {
   /** How long this output took to make. */
   time: number;
 }
+
+export type ModeRefMap = Record<string, RefMap>;
 
 export interface ParseOptions {
   logger?: Logger;

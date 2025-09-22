@@ -1,9 +1,15 @@
-import { type AnyNode, evaluate, type ObjectNode, type StringNode } from '@humanwhocodes/momoa';
-import parseRef from '@terrazzo/json-ref-parser';
-import { type GroupNormalized, parseAlias, type TokenNormalized, type TokenNormalizedSet } from '@terrazzo/token-tools';
-import type Logger from '../logger.js';
-import type { InputSource, ReferenceObject } from '../types.js';
-import { getObjMember } from './json.js';
+import { type AnyNode, type ArrayNode, evaluate, type ObjectNode, type StringNode } from '@humanwhocodes/momoa';
+import { getObjMember, parseRef, type RefMap } from '@terrazzo/json-schema-tools';
+import {
+  type GroupNormalized,
+  isAlias,
+  parseAlias,
+  type TokenNormalized,
+  type TokenNormalizedSet,
+} from '@terrazzo/token-tools';
+import wcmatch from 'wildcard-match';
+import type { default as Logger } from '../logger.js';
+import type { Config, InputSource, ModeRefMap, ReferenceObject } from '../types.js';
 
 /** Convert valid DTCG alias to $ref */
 export function aliasToRef(alias: string): ReferenceObject | undefined {
@@ -19,15 +25,15 @@ export interface TokenFromNodeOptions {
   groups: Record<string, GroupNormalized>;
   path: string[];
   source: InputSource;
+  ignore: Config['ignore'];
 }
 
 /** Generate a TokenNormalized from a Momoa node */
 export function tokenFromNode(
   node: AnyNode,
-  { groups, path, source }: TokenFromNodeOptions,
+  { groups, path, source, ignore }: TokenFromNodeOptions,
 ): TokenNormalized | undefined {
-  const isToken =
-    node.type === 'Object' && getObjMember(node, '$value') && !path.includes('$extensions') && !path.includes('$defs');
+  const isToken = node.type === 'Object' && getObjMember(node, '$value') && !path.includes('$extensions');
   if (!isToken) {
     return undefined;
   }
@@ -40,6 +46,7 @@ export function tokenFromNode(
   const group = groups[groupID]!;
   if (group?.tokens && !group.tokens.includes(id)) {
     group.tokens.push(id);
+    group.tokens.sort((a, b) => a.localeCompare(b, 'en-us', { numeric: true }));
   }
   const nodeSource = { filename: source.filename?.href, node };
   const token: TokenNormalized = {
@@ -73,6 +80,12 @@ export function tokenFromNode(
       },
     },
   };
+
+  // after assembling token, handle ignores to see if the final result should be ignored or not
+  // filter out ignored
+  if ((ignore?.deprecated && token.$deprecated) || (ignore?.tokens && wcmatch(ignore.tokens)(token.id))) {
+    return;
+  }
 
   const $extensions = getObjMember(node, '$extensions');
   if ($extensions) {
@@ -108,8 +121,7 @@ export function tokenRawValuesFromNode(
   node: AnyNode,
   { filename, path }: { filename: string; path: string[] },
 ): TokenRawValues | undefined {
-  const isToken =
-    node.type === 'Object' && getObjMember(node, '$value') && !path.includes('$extensions') && !path.includes('$defs');
+  const isToken = node.type === 'Object' && getObjMember(node, '$value') && !path.includes('$extensions');
   if (!isToken) {
     return undefined;
   }
@@ -175,7 +187,9 @@ export function groupFromNode(
   for (const groupID of groupIDs) {
     const isParentGroup = jsonID.startsWith(groupID) && groupID !== jsonID;
     if (isParentGroup) {
-      groups[jsonID] = { ...groups[groupID] } as GroupNormalized;
+      groups[jsonID].$deprecated = groups[groupID]?.$deprecated ?? groups[jsonID].$deprecated;
+      groups[jsonID].$description = groups[groupID]?.$description ?? groups[jsonID].$description;
+      groups[jsonID].$type = groups[groupID]?.$type ?? groups[jsonID].$type;
     }
   }
 
@@ -190,111 +204,134 @@ export function groupFromNode(
   return groups[jsonID]!;
 }
 
+export interface GraphAliasesOptions {
+  tokens: TokenNormalizedSet;
+  sources: Record<string, InputSource>;
+  logger: Logger;
+}
+
 /**
  * Link and reverse-link tokens in one pass.
  */
-export function graphAliases({
-  tokens,
-  jsonID,
-  refChain,
-  logger,
-  src,
-}: {
-  tokens: TokenNormalizedSet;
-  jsonID: string;
-  refChain: string[];
-  src: string;
-  logger: Logger;
-}) {
-  if (!refChain.length) {
-    return;
-  }
-
-  const allTokenIDs = Object.keys(tokens);
-  const tokenID = allTokenIDs.find((id) => jsonID.startsWith(id));
-  if (!tokenID || !tokens[tokenID]) {
-    return;
-  }
-
-  if (!tokens[tokenID].dependencies) {
-    tokens[tokenID].dependencies = [...refChain];
-  } else {
-    tokens[tokenID].dependencies.push(...refChain.filter((ref) => !tokens[tokenID]!.dependencies!.includes(ref)));
-  }
-
-  const { subpath: $refPath } = parseRef(jsonID);
-  const $valueIndex = $refPath?.indexOf('$value') ?? -1;
-
-  // This is an alias if either a $value is referenced, or has a root $ref that points directly to an existing token
-  const isAlias = $valueIndex > 0 || !!tokens[refChain.at(-1)?.replace(/\/\$value$/, '')!];
-  if (!isAlias) {
-    return;
-  }
-
-  // $value updates aliasOf, aliasedBy, partialAliasOf
-  const refChainTokenIDs = refChain
-    .map((path) => allTokenIDs.find((id) => path.startsWith(id)))
-    .filter(Boolean) as string[];
-  for (const aliasedByID of refChainTokenIDs) {
-    if (tokens[aliasedByID]) {
-      if (!tokens[aliasedByID].aliasedBy) {
-        tokens[aliasedByID].aliasedBy = [];
-      }
-      if (!tokens[aliasedByID].aliasedBy.includes(refToTokenID(tokenID)!)) {
-        tokens[aliasedByID].aliasedBy.push(refToTokenID(tokenID)!);
-      }
+export function graphAliases(modeRefMap: ModeRefMap, { tokens, logger, sources }: GraphAliasesOptions) {
+  for (const mode of Object.keys(modeRefMap)) {
+    if (!modeRefMap[mode]) {
+      modeRefMap[mode] = {};
     }
-  }
+    const refMap = modeRefMap[mode]!;
 
-  const aliasedID = refChainTokenIDs.at(-1)!;
-  tokens[tokenID].aliasOf = refToTokenID(aliasedID)!;
-  tokens[tokenID].$type = tokens[aliasedID]!.$type;
+    // mini-helper that probably shouldn’t be used outside this function
+    const getTokenRef = (ref: string) => ref.replace(/\/\$value\/?.*/, '');
 
-  // Figure out partial alias ($value is a mix of local values and $refs)
-  const partialValue = ($refPath ?? []).slice($valueIndex + 1);
-  if (!partialValue.length) {
-    return;
-  }
-
-  if (!tokens[tokenID].partialAliasOf) {
-    tokens[tokenID].partialAliasOf = Array.isArray(tokens[tokenID].$value) ? [] : {};
-  }
-  let node = tokens[tokenID]!.$value as any;
-  let sourceNode = getObjMember(tokens[tokenID]!.source.node, '$value') as AnyNode;
-  let partialAliasNode = tokens[tokenID].partialAliasOf as any;
-  for (let i = 0; i < partialValue.length; i++) {
-    const key = partialValue[i]!;
-
-    if (key in node && typeof node[key] !== 'undefined') {
-      if (sourceNode.type === 'Object') {
-        sourceNode = getObjMember(sourceNode, key)!;
-      } else if (sourceNode.type === 'Array') {
-        sourceNode = sourceNode.elements[Number(key)]!.value;
+    for (const [jsonID, { refChain }] of Object.entries(refMap)) {
+      if (!refChain.length) {
+        continue;
       }
 
-      // last node: apply partial alias
-      if (i === partialValue.length - 1) {
-        const aliasedID = refChainTokenIDs.pop()!;
-        partialAliasNode[key] = refToTokenID(aliasedID);
-        if (!(aliasedID in tokens)) {
-          logger.error({
-            group: 'parser',
-            label: 'init',
-            message: `Invalid alias: ${aliasedID}`,
-            node: sourceNode,
-            src,
-          });
+      // aliasChain + dependencies
+      const rootRef = getTokenRef(jsonID);
+      if (tokens[rootRef]) {
+        if (!tokens[rootRef].dependencies) {
+          tokens[rootRef].dependencies = [];
         }
-        node[key] = tokens[aliasedID]!.$value;
-        break;
+        tokens[rootRef].dependencies.push(...refChain.filter((r) => !tokens[rootRef]!.dependencies!.includes(r)));
+        tokens[rootRef].dependencies.sort((a, b) => a.localeCompare(b, 'en-us', { numeric: true }));
       }
 
-      node = node[key];
-      // otherwise, create deeper structure and continue traversing
-      if (!(key in partialAliasNode)) {
-        partialAliasNode[key] = Array.isArray(node[key]) ? [] : {};
+      // Top alias
+      const isTopLevelAlias = jsonID.endsWith('/$value') || tokens[jsonID];
+      if (isTopLevelAlias) {
+        // aliasOf
+        if (tokens[rootRef]) {
+          tokens[rootRef].aliasOf = refToTokenID(refChain.at(-1)!);
+          const aliasChain = refChain.map(refToTokenID) as string[];
+          tokens[rootRef]!.aliasChain = [...aliasChain];
+        }
       }
-      partialAliasNode = partialAliasNode[key];
+
+      // Partial alias
+      const partial = jsonID
+        .replace(/.*\/\$value\/?/, '')
+        .split('/')
+        .filter(Boolean);
+      if (
+        partial.length &&
+        tokens[rootRef]?.mode[mode]?.$value &&
+        typeof tokens[rootRef].mode[mode].$value === 'object'
+      ) {
+        let node: any = tokens[rootRef].mode[mode].$value;
+        let sourceNode = getObjMember(tokens[rootRef].mode[mode].source.node, '$value') as AnyNode;
+        if (!tokens[rootRef].mode[mode].partialAliasOf) {
+          tokens[rootRef].mode[mode].partialAliasOf = Array.isArray(tokens[rootRef].$value) ? [] : {};
+        }
+        let partialAliasOf = tokens[rootRef].partialAliasOf as any;
+
+        for (let i = 0; i < partial.length; i++) {
+          let key = partial[i] as string | number;
+          if (String(Number(key)) === key) {
+            key = Number(key);
+          }
+          if (key in node && typeof node[key] !== 'undefined') {
+            node = node[key];
+            if (sourceNode.type === 'Object') {
+              sourceNode = getObjMember(sourceNode, key as string)!;
+            } else if (sourceNode.type === 'Array') {
+              sourceNode = sourceNode.elements[key as number]!.value;
+            }
+          }
+          // last node: apply partial alias
+          if (i === partial.length - 1) {
+            const aliasedID = getTokenRef(refChain.at(-1)!);
+            if (!(aliasedID in tokens)) {
+              logger.error({
+                group: 'parser',
+                label: 'init',
+                message: `Invalid alias: ${aliasedID}`,
+                node: sourceNode,
+                src: sources[tokens[rootRef]!.source.filename!]?.src,
+              });
+              break;
+            }
+            partialAliasOf[key] = refToTokenID(aliasedID);
+          }
+          // otherwise, create deeper structure and continue traversing
+          if (!(key in partialAliasOf)) {
+            partialAliasOf[key] = Array.isArray(node) ? [] : {};
+          }
+          partialAliasOf = partialAliasOf[key];
+        }
+      }
+
+      // aliasedBy (reversed)
+      const aliasedByRefs = [jsonID, ...refChain].reverse();
+      for (let i = 0; i < aliasedByRefs.length; i++) {
+        const baseRef = getTokenRef(aliasedByRefs[i]!);
+        if (!tokens[baseRef]) {
+          continue;
+        }
+        const upstream = aliasedByRefs.slice(i + 1);
+        if (!upstream.length) {
+          break;
+        }
+        if (!tokens[baseRef].aliasedBy) {
+          tokens[baseRef].aliasedBy = [];
+        }
+        for (let j = 0; j < upstream.length; j++) {
+          const downstream = refToTokenID(upstream[j]!)!;
+          if (!tokens[baseRef].aliasedBy.includes(downstream)) {
+            tokens[baseRef].aliasedBy.push(downstream);
+            tokens[baseRef].aliasedBy.sort((a, b) => a.localeCompare(b, 'en-us', { numeric: true })); // sort, because the ordering is arbitrary and flaky
+          }
+        }
+      }
+
+      if (mode === '.') {
+        tokens[jsonID]!.aliasChain = tokens[jsonID]!.mode[mode].aliasChain;
+        tokens[jsonID]!.aliasedBy = tokens[jsonID]!.mode[mode].aliasedBy;
+        tokens[jsonID]!.aliasOf = tokens[jsonID]!.mode[mode].aliasOf;
+        tokens[jsonID]!.dependencies = tokens[jsonID]!.mode[mode].dependencies;
+        tokens[jsonID]!.partialAliasOf = tokens[jsonID]!.mode[mode].partialAliasOf;
+      }
     }
   }
 }
@@ -333,4 +370,143 @@ export function refToTokenID($ref: ReferenceObject | string): string | undefined
   }
   const { subpath } = parseRef(path);
   return (subpath?.length && subpath.join('.').replace(/\.\$value.*$/, '')) || undefined;
+}
+
+const EXPECTED_NESTED_ALIAS: Record<string, Record<string, string[]>> = {
+  border: {
+    color: ['color'],
+    stroke: ['strokeStyle'],
+    width: ['dimension'],
+  },
+  gradient: {
+    color: ['color'],
+    position: ['number'],
+  },
+  shadow: {
+    color: ['color'],
+    offsetX: ['dimension'],
+    offsetY: ['dimension'],
+    blur: ['dimension'],
+    spread: ['dimension'],
+    inset: ['boolean'],
+  },
+  strokeStyle: {
+    dashArray: ['dimension'],
+  },
+  transition: {
+    duration: ['duration'],
+    delay: ['duration'],
+    timingFunction: ['cubicBezier'],
+  },
+  typography: {
+    fontFamily: ['fontFamily'],
+    fontWeight: ['fontWeight'],
+    fontSize: ['dimension'],
+    lineHeight: ['dimension', 'number'],
+    letterSpacing: ['dimension'],
+  },
+};
+
+/**
+ * Resolve DTCG aliases
+ */
+export function resolveAliases(
+  tokens: TokenNormalizedSet,
+  { logger, modeRefMap, sources }: { logger: Logger; modeRefMap: ModeRefMap; sources: Record<string, InputSource> },
+): void {
+  for (const token of Object.values(tokens)) {
+    const aliasEntry = {
+      group: 'parser' as const,
+      label: 'init',
+      src: sources[token.source.filename!]?.src,
+      node: getObjMember(token.source.node, '$value'),
+    };
+
+    for (const mode of Object.keys(token.mode)) {
+      function resolveInner(alias: string, refChain: string[]): string {
+        const nextID = aliasToRef(alias);
+        if (refChain.includes(nextID?.$ref!)) {
+          logger.error({ ...aliasEntry, message: 'Circular alias detected.' });
+        }
+        const nextToken = (nextID && tokens[nextID.$ref.replace(/\/\$value$/, '')]) || undefined;
+        if (!nextToken) {
+          logger.error({ ...aliasEntry, message: `Could not resolve alias ${alias}.` });
+        }
+        refChain.push(nextID!.$ref);
+        if (isAlias(nextToken!.mode[mode]!.originalValue! as string)) {
+          return resolveInner(nextToken!.mode[mode]!.originalValue! as string, refChain);
+        }
+        return nextToken!.jsonID;
+      }
+
+      function traverseAndResolve(
+        value: any,
+        { node, expectedTypes, path }: { node: AnyNode; expectedTypes?: string[]; path: (string | number)[] },
+      ): any {
+        if (typeof value !== 'string') {
+          if (Array.isArray(value)) {
+            for (let i = 0; i < value.length; i++) {
+              if (!value[i]) {
+                continue;
+              }
+              value[i] = traverseAndResolve(value[i], {
+                node: (node as ArrayNode).elements[i]!.value,
+                // special case: cubicBezier
+                expectedTypes: expectedTypes?.includes('cubicBezier') ? ['number'] : expectedTypes,
+                path: [...path, i],
+              });
+            }
+          } else if (typeof value === 'object') {
+            for (const key of Object.keys(value)) {
+              if (!expectedTypes?.length || !EXPECTED_NESTED_ALIAS[expectedTypes[0]!]) {
+                continue;
+              }
+              value[key] = traverseAndResolve(value[key], {
+                node: getObjMember(node as ObjectNode, key)!,
+                expectedTypes: EXPECTED_NESTED_ALIAS[expectedTypes[0]!]![key],
+                path: [...path, key],
+              });
+            }
+          }
+          return value;
+        }
+
+        if (!isAlias(value)) {
+          if (!expectedTypes?.includes('string') && (value.includes('{') || value.includes('}'))) {
+            logger.error({ ...aliasEntry, message: 'Invalid alias syntax.', node });
+          }
+          return value;
+        }
+
+        const refChain: string[] = [];
+        const resolvedID = resolveInner(value, refChain);
+        if (expectedTypes?.length && !expectedTypes.includes(tokens[resolvedID]!.$type)) {
+          logger.error({
+            ...aliasEntry,
+            message: `Cannot alias to $type "${tokens[resolvedID]!.$type}" from $type "${expectedTypes.join(' / ')}".`,
+            node,
+          });
+        }
+
+        modeRefMap[mode]![path.join('/')] = { filename: token.source.filename!, refChain };
+
+        return tokens[resolvedID]!.mode[mode]?.$value || tokens[resolvedID]!.$value;
+      }
+
+      // resolve DTCG aliases without
+      const finalValue = traverseAndResolve(token.mode[mode]!.$value, {
+        node: aliasEntry.node!,
+        expectedTypes: token.$type ? [token.$type] : undefined,
+        path: [token.jsonID, '$value'],
+      });
+      if (finalValue) {
+        token.mode[mode]!.$value = finalValue;
+      }
+
+      // fill in $type and $value
+      if (mode === '.') {
+        token.$value = token.mode[mode]!.$value;
+      }
+    }
+  }
 }

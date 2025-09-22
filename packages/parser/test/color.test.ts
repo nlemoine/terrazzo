@@ -12,12 +12,16 @@ describe('8.1 Color', () => {
         given: [
           {
             filename: DEFAULT_FILENAME,
-            src: { color: { cobalt: { $type: 'color', $value: { colorSpace: 'srgb', components: [0.3, 0.6, 1] } } } },
+            src: {
+              color: {
+                cobalt: { $type: 'color', $value: { colorSpace: 'srgb', components: [0.3, 0.6, 1], alpha: 0.8 } },
+              },
+            },
           },
         ],
         want: {
           tokens: {
-            'color.cobalt': { $value: { alpha: 1, components: [0.3, 0.6, 1], colorSpace: 'srgb' } },
+            'color.cobalt': { $value: { alpha: 0.8, components: [0.3, 0.6, 1], colorSpace: 'srgb' } },
           },
         },
       },
@@ -294,6 +298,34 @@ describe('8.1 Color', () => {
    8 |         "components": [
    9 |           0.3,
   10 |           0.6,
+
+[lint:lint] 1 error`,
+        },
+      },
+    ],
+    [
+      'invalid: unknown props',
+      {
+        given: [
+          {
+            filename: DEFAULT_FILENAME,
+            src: {
+              color: {
+                cobalt: { $type: 'color', $value: { colorSpace: 'srgb', components: [0.3, 0.6, 1], bad: true } },
+              },
+            },
+          },
+        ],
+        want: {
+          error: `[lint:core/valid-color] Unknown property "bad".
+
+  10 |           1
+  11 |         ],
+> 12 |         "bad": true
+     |                ^
+  13 |       }
+  14 |     }
+  15 |   }
 
 [lint:lint] 1 error`,
         },
